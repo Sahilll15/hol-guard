@@ -78,8 +78,15 @@ def _native_context_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[P
 
         previous_native = os.environ.get("HOL_GUARD_NATIVE")
         previous_binary = os.environ.get("HOL_GUARD_NATIVE_BINARY")
+        previous_test_mode = os.environ.get("HOL_GUARD_TEST_MODE")
+        previous_diagnostic = os.environ.get("HOL_GUARD_NATIVE_DIAGNOSTIC")
+        previous_seams = os.environ.get("HOL_GUARD_RESIDENT_TEST_SEAMS")
         os.environ["HOL_GUARD_NATIVE"] = "force"
         os.environ["HOL_GUARD_NATIVE_BINARY"] = str(binary)
+        # The resident pool captures its environment when the prewarm starts.
+        os.environ["HOL_GUARD_TEST_MODE"] = "1"
+        os.environ["HOL_GUARD_NATIVE_DIAGNOSTIC"] = "1"
+        os.environ["HOL_GUARD_RESIDENT_TEST_SEAMS"] = "1"
         try:
             native_context.native_context_digest(
                 "launch_argv_digest",
@@ -95,6 +102,18 @@ def _native_context_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[P
                 os.environ.pop("HOL_GUARD_NATIVE_BINARY", None)
             else:
                 os.environ["HOL_GUARD_NATIVE_BINARY"] = previous_binary
+            if previous_test_mode is None:
+                os.environ.pop("HOL_GUARD_TEST_MODE", None)
+            else:
+                os.environ["HOL_GUARD_TEST_MODE"] = previous_test_mode
+            if previous_diagnostic is None:
+                os.environ.pop("HOL_GUARD_NATIVE_DIAGNOSTIC", None)
+            else:
+                os.environ["HOL_GUARD_NATIVE_DIAGNOSTIC"] = previous_diagnostic
+            if previous_seams is None:
+                os.environ.pop("HOL_GUARD_RESIDENT_TEST_SEAMS", None)
+            else:
+                os.environ["HOL_GUARD_RESIDENT_TEST_SEAMS"] = previous_seams
     yield guard_home
     close_native_residents(guard_home)
 
@@ -230,7 +249,7 @@ def native_prompt_runtime(
     from codex_plugin_scanner.guard.native_policy_snapshot import provision_native_policy_verifier_key
     from codex_plugin_scanner.guard.native_policy_snapshot_constants import NATIVE_POLICY_VERIFIER_KEY_NAME
     from codex_plugin_scanner.guard.native_resident_client import close_native_residents
-    from codex_plugin_scanner.guard.runtime import runner
+    from codex_plugin_scanner.guard.runtime import guard_run_evaluation as runner
 
     runtime: Path | None = None
     analyze = native_prompt.analyze
@@ -383,37 +402,70 @@ def native_command_artifact_reviews(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(commands_support_runtime_artifacts, "review_command_native", review)
 
 
-@pytest.fixture(autouse=True)
-def _close_native_policy_publishers_before_monkeypatch_restore(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[None]:
-    """Join native snapshot publishers created by test-owned workers."""
-    del monkeypatch
-    from codex_plugin_scanner.guard import native_policy_snapshot
+@pytest.fixture
+def native_data_flow_runtime(
+    native_hook_force: Path, _native_context_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Serve data-flow analysis from the real resident; there is no Python fallback."""
 
-    with native_policy_snapshot._PUBLISHER_LOCK:
-        existing_publishers = {
-            id(publisher) for registered in native_policy_snapshot._PUBLISHERS.values() for publisher in registered
-        }
-    yield
+    from codex_plugin_scanner.guard import native_data_flow
 
-    with native_policy_snapshot._PUBLISHER_LOCK:
-        publishers = tuple(
-            publisher
-            for registered in native_policy_snapshot._PUBLISHERS.values()
-            for publisher in registered
-            if id(publisher) not in existing_publishers
-        )
-    live_publishers: list[str] = []
-    for publisher in publishers:
-        publisher.close(timeout_seconds=5.0)
-        thread = getattr(publisher, "_thread", None)
-        if isinstance(thread, threading.Thread) and thread.is_alive():
-            with native_policy_snapshot._PUBLISHER_LOCK:
-                native_policy_snapshot._PUBLISHERS.setdefault(
-                    native_policy_snapshot._publisher_key(Path(publisher.guard_home)),
-                    set(),
-                ).add(publisher)
-            live_publishers.append(f"{publisher.guard_home}:{thread.name}")
-    if live_publishers:
-        raise AssertionError("native policy publisher thread(s) survived test teardown: " + ", ".join(live_publishers))
+    monkeypatch.setattr(
+        native_data_flow,
+        "_resolve_digest_home",
+        lambda guard_home: guard_home if guard_home is not None else _native_context_home,
+    )
+    return _native_context_home
+
+
+@pytest.fixture
+def native_runtime_detectors_runtime(
+    native_hook_force: Path, _native_context_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Serve the runtime detector run from the real resident; there is no Python fallback."""
+
+    from codex_plugin_scanner.guard import native_runtime_detectors
+
+    monkeypatch.setattr(native_runtime_detectors, "_resolve_digest_home", lambda _guard_home: _native_context_home)
+    return _native_context_home
+
+
+@pytest.fixture
+def native_route_policy_with_hooks_off(monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep daemon route/origin policy native while hook handling stays ``off``.
+
+    The daemon's route and origin policy is owned by the resident and has no
+    Python answer, so a test that sets ``HOL_GUARD_NATIVE=off`` to exercise
+    the Python hook fallback would otherwise see every request fail closed.
+    Only the route-policy transport call runs with the runtime pinned; hook
+    handling in the same test still observes ``off``.
+    """
+
+    from codex_plugin_scanner.guard import native_daemon_route, native_runtime
+
+    runtime = _resolve_native_hook_runtime()
+    real_request = native_daemon_route._resident_request
+    real_mode = native_runtime.native_mode
+    pinned = threading.local()
+
+    def pinned_mode():
+        # Only the thread currently inside a route request sees ``force``;
+        # concurrent hook workers keep reading the configured mode.
+        return "force" if getattr(pinned, "active", False) else real_mode()
+
+    def pinned_request(**kwargs):
+        # The caller resolved its status before the pin applied; resolve it again
+        # inside the pin so the request sees the pinned runtime.
+        kwargs.pop("status", None)
+        pinned.active = True
+        try:
+            return real_request(**kwargs)
+        finally:
+            pinned.active = False
+
+    # The runtime path is only honoured for shadow/force, so naming it is
+    # inert for hook handling that observes ``off``.
+    monkeypatch.setenv("HOL_GUARD_NATIVE_BINARY", str(runtime))
+    monkeypatch.setattr(native_runtime, "native_mode", pinned_mode)
+    monkeypatch.setattr(native_daemon_route, "_resident_request", pinned_request)
+    return runtime

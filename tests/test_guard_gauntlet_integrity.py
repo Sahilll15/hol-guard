@@ -22,7 +22,7 @@ def test_scenario_labels_do_not_influence_fixture_path_risk():
 
     names = [scenario_fixture_name(scenario.id) for scenario in load_catalog()]
     assert len(names) == len(set(names))
-    assert all(re.fullmatch(r"case-[0-9a-f]{16}", name) for name in names)
+    assert all(re.fullmatch(r"case-[0-9]{2,}", name) for name in names)
 
 
 def test_compact_fixture_paths_preserve_absolute_command_operands(tmp_path):
@@ -284,6 +284,32 @@ def test_anchor_path_metadata_is_checked_instead_of_rejecting_real_omp_edits():
     assert not input_matches("edit", sibling_args, {**sibling_args, "paths": [sibling_args["path"]]})
 
 
+@pytest.mark.parametrize(("before", "after"), [(" ", ""), ("\t", "\t"), (" \t", "  ")])
+def test_native_header_padding_keeps_exact_patch_bytes_and_reviewed_target(before, after):
+    from ci.gauntlet.input_evidence import input_matches
+    from ci.gauntlet.proofs import _edit_path
+
+    target = "src/a file.ts"
+    args = {"input": f"[{before}{target}{after}#3BE2]\nPUT 1.=1:\n+changed"}
+    reviewed = {**args, "path": target, "paths": [target]}
+    assert input_matches("edit", args, reviewed)
+    assert _edit_path(args) == target
+    assert not input_matches("edit", args, {**reviewed, "path": ".env", "paths": [".env"]})
+    assert not input_matches("edit", args, {**reviewed, "input": args["input"].replace("+changed", "+different")})
+    assert not input_matches("edit", {**args, "path": "other.ts"}, reviewed)
+
+
+@pytest.mark.parametrize("header", ["[ \t#3BE2]", "[ src/a.ts#3BE2]\n[src/b.ts#1B2C]"])
+def test_empty_or_multiple_native_edit_targets_cannot_borrow_one_review(header):
+    from ci.gauntlet.input_evidence import input_matches
+    from ci.gauntlet.proofs import _edit_path
+
+    args = {"input": header + "\nPUT 1.=1:\n+changed"}
+    reviewed = {**args, "path": "src/a.ts", "paths": ["src/a.ts"]}
+    assert not input_matches("edit", args, reviewed)
+    assert _edit_path(args) is None
+
+
 @pytest.mark.parametrize("path", ["src/one.ts", "./src/one.ts", "~/other-project/one.ts"])
 def test_resolved_read_post_inputs_remain_bound_to_original_target(path):
     from ci.gauntlet.input_evidence import post_input_matches
@@ -314,6 +340,37 @@ def test_post_input_resolution_does_not_hide_mutation_or_traversal(tool, path):
     from ci.gauntlet.input_evidence import post_input_matches
 
     assert not post_input_matches(tool, {"path": path}, {"path": "{{workspace}}/" + path})
+
+
+def test_read_selector_resolution_requires_actual_host_result_metadata():
+    from ci.gauntlet.input_evidence import post_input_matches
+
+    pre, post = {"path": "README.md:1-15"}, {"path": "{{workspace}}/README.md"}
+    result = {
+        "details": {"meta": {"source": {"type": "path", "value": post["path"]}}, "displayContent": {"startLine": 1}}
+    }
+    assert post_input_matches("read", pre, post, result)
+    assert not post_input_matches("read", pre, post)
+    assert not post_input_matches("read", pre, {"path": "{{workspace}}/.env"}, result)
+    assert not post_input_matches("read", {"path": "README.md:15-1"}, post, result)
+    assert not post_input_matches("read", pre, {**post, "limit": 500}, result)
+
+
+def test_raw_read_selector_requires_whole_file_host_result_metadata():
+    from ci.gauntlet.input_evidence import post_input_matches
+
+    pre, post = {"path": "{{workspace}}/src/one.ts:raw"}, {"path": "{{workspace}}/src/one.ts"}
+    result = {
+        "details": {"meta": {"source": {"type": "path", "value": post["path"]}}, "displayContent": {"startLine": 1}}
+    }
+    assert post_input_matches("read", pre, post, result)
+    assert not post_input_matches("read", pre, post)
+    assert not post_input_matches("read", pre, {"path": "{{workspace}}/.env"}, result)
+    assert not post_input_matches("read", pre, {**post, "limit": 500}, result)
+    late = {"details": {**result["details"], "displayContent": {"startLine": 2}}}
+    assert not post_input_matches("read", pre, post, late)
+    for selector in ("img", "RAW", "1-5:raw", "conflicts"):
+        assert not post_input_matches("read", {"path": f"src/one.ts:{selector}"}, post, result)
 
 
 def test_windows_resolved_read_paths_bind_only_whole_backslash_form():
@@ -348,8 +405,8 @@ def test_public_guard_inputs_verify_original_bytes_then_share_host_redactions():
     assert exported["input_sha256"] == input_digest(exported["input"])
     assert exported["observed_input_sha256"] == observation["input_sha256"]
     assert "input_json" not in exported
-    with pytest.raises(ValueError, match="observed digest"):
-        public_observations([{**observation, "input_json": "{}"}], {})
+    tampered = public_observations([{**observation, "input_json": "{}", "tool": "read"}], {})[0]
+    assert tampered == {"tool": "read", "observer_error": True, "observer_error_code": "input_digest_mismatch"}
 
 
 @pytest.mark.parametrize("change", ["execution_error", "returncode", "timed_out", "cleanup_ok"])

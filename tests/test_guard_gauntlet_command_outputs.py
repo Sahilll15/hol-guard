@@ -14,6 +14,7 @@ from ci.gauntlet.command_outputs import OUTPUT_SCENARIOS
 from ci.gauntlet.evidence import assess_case
 from ci.gauntlet.fixtures import SECURITY_NOTES, SOURCE, SOURCE_FILES, create_fixture, filesystem_checks
 from ci.gauntlet.proofs import required_checks
+from ci.gauntlet.script_cases import report_output, stage_script_cases
 from tests.test_guard_gauntlet_workflow_boundaries import _case, _through_live_log_redaction
 
 CATALOG = {scenario.id: scenario for scenario in load_catalog()}
@@ -53,6 +54,8 @@ OUTPUTS = {
     "quoted-workspace-copy": ["", SOURCE],
     "routed-git-inspection": [SUBDIRECTORY_STATUS, STATUS, "{{workspace}}\n"],
     "stdin-sed-transformation": ["ordinary-workflow-public\nsecond-line\n"],
+    "script-node-project-report": [report_output()],
+    "script-python-project-report": [report_output()],
 }
 CHECKED_OUTPUTS = [
     (identifier, index) for identifier, outputs in OUTPUTS.items() for index, output in enumerate(outputs) if output
@@ -106,7 +109,7 @@ def test_windows_discovery_separators_still_bind_every_source():
 
 @pytest.mark.parametrize("identifier", OUTPUTS)
 def test_pinned_omp_timing_notice_preserves_required_stdout(identifier):
-    """OMP 18.1.18 appends timing after stdout, including its trailing newline."""
+    """OMP 18.4.12 appends timing after stdout, including its trailing newline."""
     case = _observed(identifier)
     for event in case["events"]:
         if event["type"] == "tool_execution_end":
@@ -208,6 +211,8 @@ def test_real_ordinary_shell_outputs_survive_the_live_redaction_boundary(tmp_pat
     """Execute public fixture commands and verify their normalized output independently."""
     if os.name != "posix":
         pytest.skip("The live Gauntlet shell runner requires POSIX")
+    if identifier == "script-node-project-report" and shutil.which("node") is None:
+        pytest.skip("This report script requires node on PATH")
     if identifier == "search-pipeline-options" and shutil.which("rg") is None:
         pytest.skip("This fixture requires the real ripgrep executable")
     if (
@@ -216,6 +221,7 @@ def test_real_ordinary_shell_outputs_survive_the_live_redaction_boundary(tmp_pat
     ):
         pytest.skip("This exact stdin-operand regression requires GNU sed")
     fixture = create_fixture(tmp_path / "space café's output fixture")
+    stage_script_cases(fixture.workspace, identifier)
     scenario = CATALOG[identifier]
     rendered = scenario.render({"home": str(fixture.home), "workspace": str(fixture.workspace)})
     environment = {"PATH": os.environ["PATH"], "HOME": str(fixture.home), "GIT_CONFIG_NOSYSTEM": "1"}

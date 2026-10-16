@@ -8,14 +8,15 @@ fn heredoc_operator_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?<!<)(?P<operator><<-?)[ \t]*(?P<quote>['"]?)(?P<delimiter>(?:[A-Za-z_][A-Za-z0-9_]*|--[A-Za-z0-9][A-Za-z0-9_-]*))(?P=quote)"#,
+            r#"(?<!<)(?P<operator><<-?)[ \t]*(?P<quote>['"]?)(?P<delimiter>(?:[A-Za-z_][A-Za-z0-9_]*|--[A-Za-z0-9][A-Za-z0-9_-]*))(?P=quote)"#, // NOSONAR: rust:S5856; fancy_regex supports the fixed-width (?<!<) lookbehind.
         )
         .unwrap()
     })
 }
 
 /// `ShellHeredoc` (:10-23).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShellHeredoc {
     pub delimiter: String,
     pub body: String,
@@ -29,7 +30,7 @@ pub struct ShellHeredoc {
 }
 
 /// `ShellCommandSubstitution` (:25-34).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[allow(dead_code)]
 pub struct ShellCommandSubstitution {
     pub kind: &'static str, // "dollar" | "backtick"
@@ -88,6 +89,37 @@ pub fn extract_heredocs(command: &str) -> Vec<ShellHeredoc> {
         let _ = line_end;
     }
     results
+}
+
+/// Top-level `<<` operators, the same places `extract_heredocs` looks. A
+/// quoted `<<`, as in `echo '<<'`, is text.
+pub(crate) fn heredoc_operators(text: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut state = ShellScanState::new();
+    let mut index = 0;
+    let mut operators = 0;
+    while index < chars.len() {
+        // Declarations are read one line at a time, with a fresh state. A
+        // quote still open at a newline is a different `<<` than the next
+        // line's, so the two counts are not the same operator.
+        if chars[index] == '\n' {
+            if !state.is_top_level() {
+                return usize::MAX;
+            }
+            state = ShellScanState::new();
+        }
+        if state.is_top_level()
+            && chars.get(index) == Some(&'<')
+            && chars.get(index + 1) == Some(&'<')
+            && chars.get(index.wrapping_sub(1)) != Some(&'<')
+            && chars.get(index + 2) != Some(&'<')
+        {
+            operators += 1;
+        }
+        let next = state.advance(&chars, index);
+        index = if next > index { next } else { index + 1 };
+    }
+    operators
 }
 
 struct HeredocDecl {
@@ -271,13 +303,15 @@ fn extract_command_substitution_spans_impl(
         }
         if quote != Some('\'') && starts_with(&chars, index, "$(") {
             let (extracted, end_index) = extract_parenthesized(&chars, index + 2);
-            if !extracted.trim().is_empty() {
+            let whitespace = crate::command_option_parsing::python_is_whitespace;
+            if !extracted.trim_matches(whitespace).is_empty() {
                 let body_start = index + 2;
-                let leading = extracted.len() - extracted.trim_start().len();
-                let trailing = extracted.trim_end().len();
+                let leading = extracted.chars().count()
+                    - extracted.trim_start_matches(whitespace).chars().count();
+                let trailing = extracted.trim_end_matches(whitespace).chars().count();
                 substitutions.push(ShellCommandSubstitution {
                     kind: "dollar",
-                    body: extracted.trim().to_owned(),
+                    body: extracted.trim_matches(whitespace).to_owned(),
                     start: index,
                     body_start: body_start + leading,
                     body_end: body_start + trailing,
@@ -289,13 +323,15 @@ fn extract_command_substitution_spans_impl(
         }
         if quote != Some('\'') && ch == '`' {
             let (extracted, end_index) = extract_backtick(&chars, index + 1);
-            if !extracted.trim().is_empty() {
+            let whitespace = crate::command_option_parsing::python_is_whitespace;
+            if !extracted.trim_matches(whitespace).is_empty() {
                 let body_start = index + 1;
-                let leading = extracted.len() - extracted.trim_start().len();
-                let trailing = extracted.trim_end().len();
+                let leading = extracted.chars().count()
+                    - extracted.trim_start_matches(whitespace).chars().count();
+                let trailing = extracted.trim_end_matches(whitespace).chars().count();
                 substitutions.push(ShellCommandSubstitution {
                     kind: "backtick",
-                    body: extracted.trim().to_owned(),
+                    body: extracted.trim_matches(whitespace).to_owned(),
                     start: index,
                     body_start: body_start + leading,
                     body_end: body_start + trailing,
@@ -370,6 +406,31 @@ pub struct ShellScanState {
 }
 
 impl ShellScanState {
+    pub fn from_snapshot(value: &serde_json::Value) -> Result<Self, &'static str> {
+        let v = value.as_array().ok_or("shell_helpers_invalid_state")?;
+        if v.len() != 3 {
+            return Err("shell_helpers_invalid_state");
+        }
+        let quote = match v[0].as_str() {
+            Some("'") => Some('\''),
+            Some("\"") => Some('"'),
+            None if v[0].is_null() => None,
+            _ => return Err("shell_helpers_invalid_state"),
+        };
+        let subshell_depth = usize::try_from(v[1].as_u64().ok_or("shell_helpers_invalid_state")?)
+            .map_err(|_| "shell_helpers_invalid_state")?;
+        if subshell_depth.checked_add(256 * 1024).is_none() {
+            return Err("shell_helpers_invalid_state");
+        }
+        Ok(Self {
+            quote,
+            subshell_depth,
+            in_backtick: v[2].as_bool().ok_or("shell_helpers_invalid_state")?,
+        })
+    }
+    pub fn snapshot(&self) -> (Option<char>, usize, bool) {
+        (self.quote, self.subshell_depth, self.in_backtick)
+    }
     pub fn new() -> Self {
         ShellScanState {
             quote: None,
@@ -440,62 +501,5 @@ fn find_newline(chars: &[char], from: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{extract_heredocs, mask_heredoc_bodies};
-
-    #[test]
-    fn here_strings_do_not_mask_following_package_commands() {
-        for word in ["EOF", "'EOF'", "\"EOF\"", "x"] {
-            for prefix in ["cat ", "printf 'é🙂' | cat ", "printf \\é | cat "] {
-                let command = format!("{prefix}<<<{word}\nnpm install lodash");
-                let heredocs = extract_heredocs(&command);
-                assert!(heredocs.is_empty(), "{command}");
-                assert_eq!(mask_heredoc_bodies(&command, &heredocs), command);
-            }
-        }
-    }
-
-    #[test]
-    fn real_heredocs_mask_bodies_and_preserve_following_commands() {
-        for (declaration, quoted, strip_tabs, body, closing) in [
-            ("EOF", false, false, "npm install hidden\n", "EOF"),
-            ("'EOF'", true, false, "npm install hidden\n", "EOF"),
-            ("\"EOF\"", true, false, "npm install hidden\n", "EOF"),
-            ("-EOF", false, true, "\tnpm install hidden\n", "\tEOF"),
-            ("--END", false, false, "npm install hidden\n", "--END"),
-        ] {
-            for prefix in ["cat ", "printf 'é🙂' | cat ", "printf \\é | cat "] {
-                let command =
-                    format!("{prefix}<<{declaration}\n{body}{closing}\nnpm install visible");
-                let heredocs = extract_heredocs(&command);
-                assert_eq!(heredocs.len(), 1, "{command}");
-                let heredoc = &heredocs[0];
-                assert_eq!(heredoc.body, body);
-                assert_eq!(heredoc.quoted, quoted);
-                assert_eq!(heredoc.strip_tabs, strip_tabs);
-                assert_eq!(heredoc.operator_start, prefix.chars().count());
-                assert_eq!(
-                    heredoc.declaration_end,
-                    prefix.chars().count() + 2 + declaration.chars().count()
-                );
-                let masked = mask_heredoc_bodies(&command, &heredocs);
-                assert!(!masked.contains("npm install hidden"), "{command}");
-                assert!(masked.ends_with("\nnpm install visible"), "{command}");
-            }
-        }
-    }
-
-    #[test]
-    fn here_string_before_real_heredoc_does_not_consume_its_body() {
-        let command =
-            "cat <<<x; printf 'é🙂' | cat <<'EOF'\nnpm install hidden\nEOF\nnpm install visible";
-        let heredocs = extract_heredocs(command);
-        assert_eq!(heredocs.len(), 1);
-        assert_eq!(heredocs[0].delimiter, "EOF");
-        assert_eq!(heredocs[0].body, "npm install hidden\n");
-        let masked = mask_heredoc_bodies(command, &heredocs);
-        assert!(masked.starts_with("cat <<<x;"));
-        assert!(!masked.contains("npm install hidden"));
-        assert!(masked.ends_with("\nnpm install visible"));
-    }
-}
+#[path = "shell_structure_tests.rs"]
+mod tests;

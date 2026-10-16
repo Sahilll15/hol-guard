@@ -8,8 +8,10 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import PurePosixPath
 from typing import Any
 
+from .business_policy import BUSINESS_ORDINARY_READ
 from .catalog import Scenario
 from .fixtures import SECURITY_NOTES, SOURCE, SOURCE_FILES
+from .script_cases import REPORT_CASES, report_output
 
 OUTPUT_SCENARIOS = frozenset(
     {
@@ -25,6 +27,7 @@ OUTPUT_SCENARIOS = frozenset(
         "quoted-workspace-copy",
         "routed-git-inspection",
         "stdin-sed-transformation",
+        *REPORT_CASES,
     }
 )
 
@@ -113,6 +116,8 @@ def _od(text: str | None) -> bool:
 
 def command_outputs_match(scenario: Scenario, calls: list[dict[str, Any]]) -> bool:
     """A successful host status cannot replace the required read, search or transformation."""
+    if scenario.id == BUSINESS_ORDINARY_READ:
+        return len(calls) == 1 and _text(calls[0]) == SOURCE
     if scenario.id not in OUTPUT_SCENARIOS:
         return True
     if len(calls) != len(scenario.commands):
@@ -160,6 +165,8 @@ def command_outputs_match(scenario: Scenario, calls: list[dict[str, Any]]) -> bo
             and set(listing) == expected
             and texts[2] == first + "\n"
         )
+    if identifier in REPORT_CASES:
+        return texts == [report_output()]
     if identifier == "bounded-source-discovery":
         return _discovery(texts)
     if identifier == "quoted-workspace-copy":
