@@ -691,6 +691,7 @@
           "command.cloudg",
           "command.codesage",
           "command.cogext",
+          "command.crisp-tui",
           "command.cs",
           "command.ctty",
           "command.dataman",
